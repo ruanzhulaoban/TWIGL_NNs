@@ -4,13 +4,13 @@
   - nullspace_basis：返回零空间的一组正交基（列向量）；
   - solve_nullspace：返回一个归一化（最大分量为 1）的非零解向量。
 
-仅依赖 PyTorch，使用 float64 以应对病态矩阵。
+仅依赖 PyTorch，使用 float32。
 """
 
 import torch
 
 
-def nullspace_basis(A: torch.Tensor, tol: float = 1e-10) -> torch.Tensor:
+def nullspace_basis(A: torch.Tensor, tol: float = 1e-6) -> torch.Tensor:
     """返回 A 的零空间的一组正交基（列向量）。
 
     返回形状 (n, d) 的张量，d 为零空间维数；各列满足 A @ v ≈ 0。
@@ -19,12 +19,12 @@ def nullspace_basis(A: torch.Tensor, tol: float = 1e-10) -> torch.Tensor:
     参数
     ----
     A : torch.Tensor
-        系数矩阵，形状 (m, n)，双精度（float64）。
+        系数矩阵，形状 (m, n)，单精度（float32）。
     tol : float
         奇异值判定阈值，小于该值视为零空间基。
     """
-    if A.dtype != torch.float64:
-        A = A.to(torch.float64)
+    if A.dtype != torch.float32:
+        A = A.to(torch.float32)
 
     if A.ndim != 2:
         raise ValueError(f"输入应为二维矩阵，实际维度为 {A.ndim}")
@@ -40,7 +40,7 @@ def nullspace_basis(A: torch.Tensor, tol: float = 1e-10) -> torch.Tensor:
     return V[:, null_indices].contiguous()
 
 
-def solve_nullspace(A: torch.Tensor, tol: float = 1e-10) -> torch.Tensor:
+def solve_nullspace(A: torch.Tensor, tol: float = 1e-6) -> torch.Tensor:
     """求解齐次线性方程组 A x = 0，返回一个归一化的非零解。
 
     返回

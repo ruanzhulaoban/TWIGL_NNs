@@ -23,7 +23,7 @@ TWIGL 裂变谱：χ = (1.0, 0.0)（裂变中子全部产生于快群）；散�
 
 注意：源项 Q 用 detach()/no_grad 计算，不参与梯度。
 
-仅依赖 PyTorch，使用 float64。
+仅依赖 PyTorch，使用 float32。
 """
 
 import torch
@@ -54,14 +54,14 @@ def _legendre_val(n, x):
 
 
 def gauss_legendre(n):
-    """n 点 Gauss-Legendre 节点与权重（区间 [-1, 1]），纯 torch float64。"""
-    i = torch.arange(n, dtype=torch.float64)
+    """n 点 Gauss-Legendre 节点与权重（区间 [-1, 1]），纯 torch float32。"""
+    i = torch.arange(n, dtype=torch.float32)
     x = torch.cos(torch.pi * (i + 0.75) / (n + 0.5))  # 初值（Chebyshev）
     for _ in range(200):
         pn, pnm1 = _legendre_val(n, x)
         dpn = n * (x * pn - pnm1) / (x * x - 1.0)
         x_new = x - pn / dpn
-        if (x_new - x).abs().max() < 1e-15:
+        if (x_new - x).abs().max() < 1e-6:
             x = x_new
             break
         x = x_new
@@ -108,7 +108,7 @@ def make_training_points(n_sub=50):
 def material_tensors(region, device):
     """按每点的区域索引构造材料参数字段（各字段形状 [N]）。"""
     keys = ["D1", "D2", "Sr1", "Sr2", "nuSf1", "nuSf2", "Ss12", "Ss21"]
-    out = {k: torch.empty(region.numel(), dtype=torch.float64, device=device)
+    out = {k: torch.empty(region.numel(), dtype=torch.float32, device=device)
            for k in keys}
     for r, p in REGION_PARAMS.items():
         mask = region == r
@@ -339,6 +339,7 @@ def train(n_sub=50, n_poly=5, hidden_layers=8, neurons=400,
             plot_history(history, f"{save_path}_history.png")
 
         # ---- 收敛判断 ----
+        keff = keff_new  # 提前更新：即使收敛 break，也能保存/打印最新 keff
         if keff_change < keff_tol and loss_change < loss_tol:
             if verbose:
                 print(f"收敛：|Δkeff|={keff_change:.3e}<{keff_tol} 且 "
@@ -348,7 +349,6 @@ def train(n_sub=50, n_poly=5, hidden_layers=8, neurons=400,
         phi1_prev = phi1_new.clone()
         phi2_prev = phi2_new.clone()
         F_old = F_new
-        keff = keff_new
         total_loss_old = total_loss
 
     # ---- 最终绘制（覆盖未整除 plot_every 的收尾迭代，含提前收敛） ----

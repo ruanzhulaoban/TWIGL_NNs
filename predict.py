@@ -39,8 +39,8 @@ def predict_fluxes(net1, net2, n_grid=400, device="cuda"):
 
     返回 (X, Y, phi1, phi2)，均为 numpy 数组，X/Y 为网格坐标。
     """
-    xs = torch.linspace(XS[0], XS[-1], n_grid, dtype=torch.float64, device=device)
-    ys = torch.linspace(YS[0], YS[-1], n_grid, dtype=torch.float64, device=device)
+    xs = torch.linspace(XS[0], XS[-1], n_grid, dtype=torch.float32, device=device)
+    ys = torch.linspace(YS[0], YS[-1], n_grid, dtype=torch.float32, device=device)
     gx, gy = torch.meshgrid(xs, ys, indexing="ij")
     with torch.no_grad():
         phi1 = net1(gx, gy).cpu().numpy()

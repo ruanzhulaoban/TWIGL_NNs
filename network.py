@@ -48,7 +48,7 @@ class PSNNNet(nn.Module):
 
     def __init__(self, B_func, s_func, B_coeffs=None, s_coeffs=None, n=5,
                  hidden_layers=8, neurons=400, activation=nn.Tanh,
-                 dtype=torch.float64):
+                 dtype=torch.float32):
         """
         参数
         ----
@@ -69,7 +69,7 @@ class PSNNNet(nn.Module):
         activation : type
             激活函数类（如 nn.Tanh），默认 nn.Tanh。
         dtype : torch.dtype
-            网络工作精度，默认 float64（与 B、s 一致）。
+            网络工作精度，默认 float32（与 B、s 一致）。
         """
         super().__init__()
         self.B_func = B_func
@@ -136,7 +136,7 @@ class PSNNNet(nn.Module):
         torch.save(ckpt, path)
 
     @classmethod
-    def load(cls, path, activation=None, dtype=torch.float64):
+    def load(cls, path, activation=None, dtype=torch.float32):
         """从 path 载入，返回 (model, keff, meta)。
 
         B、s 由 checkpoint 中保存的系数确定性重建，不重新做 SVD。
@@ -165,7 +165,7 @@ class PSNNNet(nn.Module):
 
 
 def make_psnn(g, n=5, Nd=None, hidden_layers=8, neurons=400,
-              activation=nn.Tanh, dtype=torch.float64, tol=1e-10):
+              activation=nn.Tanh, dtype=torch.float32, tol=1e-6):
     """便捷构造：构造 B_func、s_func_g 与能群 g 的 PSNNNet。
 
     B、s 的系数与阶数会被一并保存进模型（供 save/load 确定性重建）。
@@ -179,7 +179,7 @@ def make_psnn(g, n=5, Nd=None, hidden_layers=8, neurons=400,
 
 
 def reconstruct_net(B_coeffs, s_coeffs, n, hidden_layers=8, neurons=400,
-                    activation=nn.Tanh, dtype=torch.float64, device="cuda"):
+                    activation=nn.Tanh, dtype=torch.float32, device="cuda"):
     """由 B、s 系数确定性重建网络（不重做 SVD）。
 
     用于多进程并行：父进程先算好 B_coeffs / s_coeffs，子进程据此重建网络，
@@ -201,15 +201,15 @@ if __name__ == "__main__":
     print(f"可训练参数数量: {n_params}")
 
     # 前向（批量 [N]）
-    x = torch.linspace(0.0, 0.8, 100, dtype=torch.float64)
-    y = torch.linspace(0.0, 0.8, 100, dtype=torch.float64)
+    x = torch.linspace(0.0, 0.8, 100, dtype=torch.float32)
+    y = torch.linspace(0.0, 0.8, 100, dtype=torch.float32)
     phi = model(x, y)
     print(f"φ shape: {tuple(phi.shape)}, dtype: {phi.dtype}, "
           f"范围: [{phi.min().item():.4g}, {phi.max().item():.4g}]")
 
     # 可微性（用于 PDE 残差 / 自动求导）
-    xr = torch.linspace(0.2, 0.6, 16, dtype=torch.float64, requires_grad=True)
-    yr = torch.linspace(0.2, 0.6, 16, dtype=torch.float64, requires_grad=True)
+    xr = torch.linspace(0.2, 0.6, 16, dtype=torch.float32, requires_grad=True)
+    yr = torch.linspace(0.2, 0.6, 16, dtype=torch.float32, requires_grad=True)
     loss = (model(xr, yr) ** 2).sum()
     loss.backward()
     w = next(model.parameters())

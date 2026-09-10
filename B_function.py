@@ -18,7 +18,7 @@ B 用于通量重构 φ = B * NNs，其中 B 满足：
   在所有边界与界面上取 Nd 个离散点（Nd ≤ n-1），对每个约束点列线性方程，
   形成齐次方程组 A · coeff = 0，再调用 svd.solve_nullspace 求零空间解。
 
-仅依赖 PyTorch，使用 float64 以应对病态矩阵。
+仅依赖 PyTorch，使用 float32。
 """
 
 import torch
@@ -74,7 +74,7 @@ def _basis_row(x, y, n, deriv="value"):
     系数排列 index = a*(n+1)+b，对应 x^a y^b。
     """
     nt = (n + 1) * (n + 1)
-    row = torch.zeros(nt, dtype=torch.float64)
+    row = torch.zeros(nt, dtype=torch.float32)
     idx = 0
     for a in range(n + 1):
         xa = x ** a
@@ -101,14 +101,14 @@ def _build_constraint_matrix(n, Nd):
 
     def add_point_constraint(ix, iy, x, y, deriv):
         """对子矩形 (ix, iy) 的多项式在某点施加齐次约束（= 0）。"""
-        row = torch.zeros(ntot, dtype=torch.float64)
+        row = torch.zeros(ntot, dtype=torch.float32)
         off = cell_id(ix, iy) * nt
         row[off:off + nt] = _basis_row(x, y, n, deriv)
         rows.append(row)
 
     def add_pair_constraint(ix1, iy1, ix2, iy2, x, y, d1, d2):
         """界面连续性：cell1 与 cell2 在点上的 (导数)值之差为 0。"""
-        row = torch.zeros(ntot, dtype=torch.float64)
+        row = torch.zeros(ntot, dtype=torch.float32)
         o1 = cell_id(ix1, iy1) * nt
         o2 = cell_id(ix2, iy2) * nt
         row[o1:o1 + nt] = _basis_row(x, y, n, d1)
@@ -117,7 +117,7 @@ def _build_constraint_matrix(n, Nd):
 
     def interior_pts(lo, hi):
         """在 (lo, hi) 内取 Nd 个等距内部点。"""
-        return torch.linspace(lo, hi, Nd + 2, dtype=torch.float64)[1:-1]
+        return torch.linspace(lo, hi, Nd + 2, dtype=torch.float32)[1:-1]
 
     # ---- 外边界 ----
     # 右边界 x=0.8: B=0
@@ -167,8 +167,8 @@ def _make_B_func(coeffs, n):
     nt = (n + 1) * (n + 1)
 
     def B_func(x, y):
-        x = torch.as_tensor(x, dtype=torch.float64)
-        y = torch.as_tensor(y, dtype=torch.float64)
+        x = torch.as_tensor(x, dtype=torch.float32)
+        y = torch.as_tensor(y, dtype=torch.float32)
         x, y = torch.broadcast_tensors(x, y)
         shape = x.shape
         xf = x.reshape(-1).contiguous()
@@ -176,15 +176,15 @@ def _make_B_func(coeffs, n):
         dev = xf.device
 
         # 单点各次幂与单项式矩阵 (N, nt)
-        pows = torch.arange(n + 1, dtype=torch.float64, device=dev)
+        pows = torch.arange(n + 1, dtype=torch.float32, device=dev)
         xp = xf[:, None].pow(pows)                       # (N, n+1)
         yp = yf[:, None].pow(pows)                       # (N, n+1)
         mono = (xp[:, :, None] * yp[:, None, :]).reshape(-1, nt)  # (N, nt)
 
         # 每个子矩形单独求值 (N, N_CELLS)，再按点所在子矩形选取
         vals = mono @ coeffs.to(dev).T                    # (N, N_CELLS)
-        bnd_x = torch.tensor(XS[1:-1], dtype=torch.float64, device=dev)
-        bnd_y = torch.tensor(YS[1:-1], dtype=torch.float64, device=dev)
+        bnd_x = torch.tensor(XS[1:-1], dtype=torch.float32, device=dev)
+        bnd_y = torch.tensor(YS[1:-1], dtype=torch.float32, device=dev)
         ix = torch.bucketize(xf, bnd_x)
         iy = torch.bucketize(yf, bnd_y)
         cid = iy * NX + ix
@@ -195,7 +195,7 @@ def _make_B_func(coeffs, n):
 
 
 # ==================== 主入口 ====================
-def build_B(n=5, Nd=None, tol=1e-10):
+def build_B(n=5, Nd=None, tol=1e-6):
     """构造分片多项式 B(x, y)，返回 (B_func, coeffs)。
 
     参数
@@ -228,8 +228,8 @@ def build_B(n=5, Nd=None, tol=1e-10):
     # 按 B 的函数值归一化：使 max|B(x, y)| ≈ 1（B 的量级归一）
     B_tmp = _make_B_func(coeffs, n)
     gx, gy = torch.meshgrid(
-        torch.linspace(XS[0], XS[-1], 201, dtype=torch.float64),
-        torch.linspace(YS[0], YS[-1], 201, dtype=torch.float64),
+        torch.linspace(XS[0], XS[-1], 201, dtype=torch.float32),
+        torch.linspace(YS[0], YS[-1], 201, dtype=torch.float32),
         indexing="ij",
     )
     scale = B_tmp(gx, gy).abs().max()
@@ -267,8 +267,8 @@ if __name__ == "__main__":
     print(f"\n约束残差 ||A@coeff||_max = {resid.abs().max().item():.3e}")
 
     # 边界值校验
-    xs = torch.linspace(0.0, 0.8, 40, dtype=torch.float64)
-    ys = torch.linspace(0.0, 0.8, 40, dtype=torch.float64)
+    xs = torch.linspace(0.0, 0.8, 40, dtype=torch.float32)
+    ys = torch.linspace(0.0, 0.8, 40, dtype=torch.float32)
     gx, gy = torch.meshgrid(xs, ys, indexing="ij")
     B = B_func(gx, gy)
     print(f"B 值范围: [{B.min().item():.4g}, {B.max().item():.4g}]")

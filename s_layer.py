@@ -19,7 +19,7 @@ s 的约束条件（仅内部界面，无外边界约束）：
   在界面离散点（Nd ≤ n-1）上列出连续性与法向导数方程，调用 SVD 求零空间，
   再按函数值归一化（max|u| ≈ 1、max|v| ≈ 1）。
 
-仅依赖 PyTorch，使用 float64。
+仅依赖 PyTorch，使用 float32。
 """
 
 import torch
@@ -48,20 +48,20 @@ def _build_constraint_matrix(n, Nd, g):
 
     def add_continuity(c1, c2, x, y):
         """值连续性：P(c1) - P(c2) = 0。"""
-        row = torch.zeros(ntot, dtype=torch.float64)
+        row = torch.zeros(ntot, dtype=torch.float32)
         row[c1 * nt:(c1 + 1) * nt] = _basis_row(x, y, n, "value")
         row[c2 * nt:(c2 + 1) * nt] -= _basis_row(x, y, n, "value")
         rows.append(row)
 
     def add_flux(c1, c2, x, y, D1, D2, deriv):
         """D 加权法向导数连续：D1·∂P(c1) - D2·∂P(c2) = 0。"""
-        row = torch.zeros(ntot, dtype=torch.float64)
+        row = torch.zeros(ntot, dtype=torch.float32)
         row[c1 * nt:(c1 + 1) * nt] = D1 * _basis_row(x, y, n, deriv)
         row[c2 * nt:(c2 + 1) * nt] -= D2 * _basis_row(x, y, n, deriv)
         rows.append(row)
 
     def interior_pts(lo, hi):
-        return torch.linspace(lo, hi, Nd + 2, dtype=torch.float64)[1:-1]
+        return torch.linspace(lo, hi, Nd + 2, dtype=torch.float32)[1:-1]
 
     # 竖直界面 x=0.24, 0.56（法向 x）
     for xi in (1, 2):
@@ -92,7 +92,7 @@ def _build_constraint_matrix(n, Nd, g):
     return torch.stack(rows, dim=0)
 
 
-def build_s(g, n=5, Nd=None, tol=1e-10):
+def build_s(g, n=5, Nd=None, tol=1e-6):
     """构造能群 g 的分片多项式向量函数 s_g(x, y) = (u, v)。
 
     参数
@@ -139,8 +139,8 @@ def build_s(g, n=5, Nd=None, tol=1e-10):
     u_tmp = _make_piecewise_func(coeff_u, n)
     v_tmp = _make_piecewise_func(coeff_v, n)
     gx, gy = torch.meshgrid(
-        torch.linspace(XS[0], XS[-1], 201, dtype=torch.float64),
-        torch.linspace(YS[0], YS[-1], 201, dtype=torch.float64),
+        torch.linspace(XS[0], XS[-1], 201, dtype=torch.float32),
+        torch.linspace(YS[0], YS[-1], 201, dtype=torch.float32),
         indexing="ij",
     )
     su = u_tmp(gx, gy).abs().max()
@@ -173,8 +173,8 @@ if __name__ == "__main__":
         r_v = (A @ coeffs[1].reshape(-1)).abs().max().item()
         print(f"约束残差 ||A@coeff_u||_max = {r_u:.3e}, ||A@coeff_v||_max = {r_v:.3e}")
 
-        xs = torch.linspace(0.0, 0.8, 60, dtype=torch.float64)
-        ys = torch.linspace(0.0, 0.8, 60, dtype=torch.float64)
+        xs = torch.linspace(0.0, 0.8, 60, dtype=torch.float32)
+        ys = torch.linspace(0.0, 0.8, 60, dtype=torch.float32)
         gx, gy = torch.meshgrid(xs, ys, indexing="ij")
         u, v = s_func(gx, gy)
         print(f"u 范围: [{u.min().item():.4g}, {u.max().item():.4g}], "
