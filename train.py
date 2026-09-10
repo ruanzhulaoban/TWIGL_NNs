@@ -26,6 +26,9 @@ TWIGL 裂变谱：χ = (1.0, 0.0)（裂变中子全部产生于快群）；散�
 仅依赖 PyTorch，使用 float32。
 """
 
+import json
+import os
+
 import torch
 import torch.nn as nn
 
@@ -35,7 +38,7 @@ import matplotlib.pyplot as plt
 
 from B_function import XS, YS, NX, NY, region_of, REGION_PARAMS, build_B
 from s_layer import build_s
-from network import PSNNNet
+from network import PSNNNet, reconstruct_net
 
 # TWIGL 裂变谱（χ1=1, χ2=0：裂变中子全部产生于快群）
 CHI = (1.0, 0.0)
@@ -244,11 +247,101 @@ def plot_history(history, path, dpi=150):
     plt.close(fig)
 
 
+# ==================== 实时落盘（原子写入，避免中断留下半文件） ====================
+def save_history(history, path):
+    """实时把训练历史（损失/keff）写入 JSON 文件。
+
+    history 为 list[dict]，含 iter/keff/keff_change/loss1/loss2/total_loss/
+    loss_change。先写临时文件并 fsync，再 os.replace 原子替换，保证任意时刻
+    磁盘上都是一份完整、可读的最新历史。
+    """
+    if not history:
+        return
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def save_ckpt_atomic(net, path, keff, group):
+    """原子保存单个能群网络：先写 .tmp 再 os.replace，覆盖为最新权重。"""
+    tmp = path + ".tmp"
+    net.save(tmp, keff=keff, group=group)
+    os.replace(tmp, path)
+
+
+def save_checkpoint(path, net1, net2, opt1, opt2, n_done, keff, history,
+                    total_loss_old, n_sub, max_outer, keff_tol, loss_tol):
+    """保存断点续训所需的完整状态（原子写入）。
+
+    与单个模型文件（save_ckpt_atomic）不同，这里额外保存两个 Adam 优化器的
+    状态、已完成的外层迭代数 n_done、训练历史与收敛阈值，供中断后精确续训。
+    B、s 系数一并保存，恢复时确定性重建而不重做 SVD。
+    """
+    ckpt = {
+        "net1_state_dict": net1.state_dict(),
+        "net2_state_dict": net2.state_dict(),
+        "opt1_adam": opt1.state_dict(),
+        "opt2_adam": opt2.state_dict(),
+        # 网络确定性重建信息
+        "n": net1.n,
+        "hidden_layers": net1.hidden_layers,
+        "neurons": net1.neurons,
+        "activation": net1.activation_name,
+        "B_coeffs": net1.B_coeffs,
+        "s1_coeffs": net1.s_coeffs,
+        "s2_coeffs": net2.s_coeffs,
+        # 训练状态
+        "n_done": n_done,
+        "keff": keff,
+        "history": history,
+        "total_loss_old": total_loss_old,
+        "n_sub": n_sub,
+        "max_outer": max_outer,
+        "keff_tol": keff_tol,
+        "loss_tol": loss_tol,
+    }
+    tmp = path + ".tmp"
+    torch.save(ckpt, tmp)
+    os.replace(tmp, path)
+
+
+def load_checkpoint(path, device, adam_lr):
+    """载入断点，确定性重建两个网络与 Adam 优化器。
+
+    返回 (net1, net2, opt1, opt2, state)。state 含 n_done/keff/history/
+    total_loss_old/n_sub/max_outer/keff_tol/loss_tol 等续训所需字段。
+    """
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    act_name = ckpt.get("activation", "Tanh")
+    activation = getattr(nn, act_name, nn.Tanh)
+    net1 = reconstruct_net(ckpt["B_coeffs"], ckpt["s1_coeffs"], ckpt["n"],
+                           hidden_layers=ckpt["hidden_layers"],
+                           neurons=ckpt["neurons"],
+                           activation=activation, dtype=torch.float32,
+                           device=device)
+    net2 = reconstruct_net(ckpt["B_coeffs"], ckpt["s2_coeffs"], ckpt["n"],
+                           hidden_layers=ckpt["hidden_layers"],
+                           neurons=ckpt["neurons"],
+                           activation=activation, dtype=torch.float32,
+                           device=device)
+    net1.load_state_dict(ckpt["net1_state_dict"])
+    net2.load_state_dict(ckpt["net2_state_dict"])
+    opt1 = torch.optim.Adam(net1.parameters(), lr=adam_lr)
+    opt2 = torch.optim.Adam(net2.parameters(), lr=adam_lr)
+    opt1.load_state_dict(ckpt["opt1_adam"])
+    opt2.load_state_dict(ckpt["opt2_adam"])
+    return net1, net2, opt1, opt2, ckpt
+
+
 # ==================== 主训练流程 ====================
 def train(n_sub=50, n_poly=5, hidden_layers=8, neurons=400,
           adam_lr=1e-3, adam_steps=50000, lbfgs_lr=1.0, lbfgs_steps=500,
           max_outer=30, keff_tol=1e-6, loss_tol=1e-4,
-          device="cuda", save_path="twigl", plot_every=1, verbose=True):
+          device="cuda", save_path="twigl", plot_every=1, ckpt_every=1,
+          resume=True, verbose=True):
     """源迭代求解 TWIGL，返回 (net1, net2, keff, history)。
 
     参数
@@ -270,10 +363,17 @@ def train(n_sub=50, n_poly=5, hidden_layers=8, neurons=400,
     device : str
         "cuda" 或 "cpu"，默认 "cuda"。
     save_path : str
-        保存前缀，实际保存为 <save_path>_g1.pt / <save_path>_g2.pt。
+        保存前缀，实际保存为 <save_path>_g1.pt / <save_path>_g2.pt（实时覆盖，
+        始终为最新权重）与 <save_path>_history.json（实时训练历史）。
     plot_every : int
         每多少个外层迭代更新一次损失/keff 折线图（实时监控），
         折线图保存为 <save_path>_history.png；设为 0 或负数则关闭绘图。
+    ckpt_every : int
+        每多少个外层迭代实时覆盖保存一次模型权重（默认 1，即每个外层迭代都
+        落盘）；设为 0 或负数则仅在训练结束时保存。
+    resume : bool
+        若为 True 且存在 <save_path>_checkpoint.pt，则自动从断点续训；
+        否则从头训练。
     """
     # 1. 训练点
     x, y, w, region = make_training_points(n_sub=n_sub)
@@ -282,23 +382,47 @@ def train(n_sub=50, n_poly=5, hidden_layers=8, neurons=400,
     w = w.to(device)
     mat = material_tensors(region, device)
 
-    # 2. 两个能群网络（共享 B）
-    net1, net2 = build_networks(n_poly=n_poly, hidden_layers=hidden_layers,
-                                neurons=neurons, device=device)
+    # 实时保存路径：模型权重/断点每次覆盖为最新，历史 JSON 每轮追加写入
+    p1 = f"{save_path}_g1.pt"
+    p2 = f"{save_path}_g2.pt"
+    history_path = f"{save_path}_history.json"
+    ckpt_path = f"{save_path}_checkpoint.pt"
 
-    # 3. 初始 φ=1.0，初始 keff=1.0，初始裂变源
-    phi1_prev = torch.ones_like(x)
-    phi2_prev = torch.ones_like(x)
-    keff = 1.0
-    F_old = fission_source_total(mat, phi1_prev, phi2_prev, w).item()
+    # 2. 网络与优化器：存在断点则恢复续训，否则全新构造
+    n_done = 0
+    if resume and os.path.exists(ckpt_path):
+        net1, net2, opt1_adam, opt2_adam, state = load_checkpoint(
+            ckpt_path, device, adam_lr)
+        keff = state["keff"]
+        history = list(state["history"])
+        total_loss_old = state["total_loss_old"]
+        n_done = state["n_done"]
+        # 用最新权重重算上一轮通量与裂变源（与保存时刻的网络状态一致）
+        with torch.no_grad():
+            phi1_prev = net1(x, y)
+            phi2_prev = net2(x, y)
+        F_old = fission_source_total(mat, phi1_prev, phi2_prev, w).item()
+        if state.get("n_sub", n_sub) != n_sub and verbose:
+            print(f"Warning: 断点 n_sub={state.get('n_sub')} 与当前 {n_sub} 不一致，"
+                  f"训练点按当前值重建，续训结果可能偏离。")
+        if verbose:
+            print(f"已恢复断点 {ckpt_path}：完成 {n_done}/"
+                  f"{state.get('max_outer', '?')} 轮，keff={keff:.8f}，"
+                  f"续训自第 {n_done + 1} 轮。")
+    else:
+        net1, net2 = build_networks(n_poly=n_poly, hidden_layers=hidden_layers,
+                                    neurons=neurons, device=device)
+        opt1_adam = torch.optim.Adam(net1.parameters(), lr=adam_lr)
+        opt2_adam = torch.optim.Adam(net2.parameters(), lr=adam_lr)
+        # 初始 φ=1.0，初始 keff=1.0，初始裂变源
+        phi1_prev = torch.ones_like(x)
+        phi2_prev = torch.ones_like(x)
+        keff = 1.0
+        F_old = fission_source_total(mat, phi1_prev, phi2_prev, w).item()
+        history = []
+        total_loss_old = float("inf")
 
-    opt1_adam = torch.optim.Adam(net1.parameters(), lr=adam_lr)
-    opt2_adam = torch.optim.Adam(net2.parameters(), lr=adam_lr)
-
-    history = []
-    total_loss_old = float("inf")
-
-    for n in range(1, max_outer + 1):
+    for n in range(n_done + 1, max_outer + 1):
         # ---- 群 1：源项用上一轮 φ1、φ2 ----
         Q1, _ = compute_sources(phi1_prev, phi2_prev, keff, mat)
         loss1 = train_group(net1, opt1_adam, x, y, mat["D1"], mat["Sr1"], Q1,
@@ -338,6 +462,19 @@ def train(n_sub=50, n_poly=5, hidden_layers=8, neurons=400,
         if plot_every > 0 and (n % plot_every == 0 or n == max_outer):
             plot_history(history, f"{save_path}_history.png")
 
+        # ---- 实时保存训练历史（JSON）与最新模型权重 ----
+        save_history(history, history_path)
+        if ckpt_every > 0 and (n % ckpt_every == 0 or n == max_outer):
+            save_ckpt_atomic(net1, p1, keff_new, group=1)
+            save_ckpt_atomic(net2, p2, keff_new, group=2)
+            save_checkpoint(ckpt_path, net1, net2, opt1_adam, opt2_adam,
+                            n_done=n, keff=keff_new, history=history,
+                            total_loss_old=total_loss, n_sub=n_sub,
+                            max_outer=max_outer, keff_tol=keff_tol,
+                            loss_tol=loss_tol)
+            if verbose:
+                print(f"    已实时保存检查点：{p1}、{p2}、{ckpt_path}")
+
         # ---- 收敛判断 ----
         keff = keff_new  # 提前更新：即使收敛 break，也能保存/打印最新 keff
         if keff_change < keff_tol and loss_change < loss_tol:
@@ -355,11 +492,15 @@ def train(n_sub=50, n_poly=5, hidden_layers=8, neurons=400,
     if plot_every > 0:
         plot_history(history, f"{save_path}_history.png")
 
-    # ---- 保存模型（含 B、s 系数与 keff，load 时确定性重建） ----
-    p1 = f"{save_path}_g1.pt"
-    p2 = f"{save_path}_g2.pt"
-    net1.save(p1, keff=keff, group=1)
-    net2.save(p2, keff=keff, group=2)
+    # ---- 最终保存（原子写入；历史 JSON 同步收尾，保证与最终权重一致） ----
+    save_ckpt_atomic(net1, p1, keff, group=1)
+    save_ckpt_atomic(net2, p2, keff, group=2)
+    save_history(history, history_path)
+    # 训练正常结束，删除断点文件，避免下次运行时误判为未完成而续训
+    if os.path.exists(ckpt_path):
+        os.remove(ckpt_path)
+        if verbose:
+            print(f"训练完成，已删除断点文件 {ckpt_path}。")
     if verbose:
         print(f"已保存：{p1}、{p2}（keff={keff:.8f}）")
 
@@ -384,6 +525,12 @@ if __name__ == "__main__":
     p.add_argument("--lbfgs_lr", type=float, default=1.0, help="L-BFGS 学习率")
     p.add_argument("--lbfgs_steps", type=int, default=500, help="L-BFGS 最大步数")
     p.add_argument("--max_outer", type=int, default=30, help="外层最大迭代数")
+    p.add_argument("--ckpt_every", type=int, default=1,
+                   help="每多少个外层迭代实时保存一次模型权重")
+    p.add_argument("--resume", dest="resume", action="store_true", default=True,
+                   help="若存在 <save_path>_checkpoint.pt 则自动续训（默认）")
+    p.add_argument("--no-resume", dest="resume", action="store_false",
+                   help="忽略已有断点，从头训练")
     p.add_argument("--keff_tol", type=float, default=1e-6, help="keff 收敛容差")
     p.add_argument("--loss_tol", type=float, default=1e-4, help="损失收敛容差")
     args = p.parse_args()
@@ -403,6 +550,7 @@ if __name__ == "__main__":
         lbfgs_lr=args.lbfgs_lr, lbfgs_steps=args.lbfgs_steps,
         max_outer=args.max_outer, keff_tol=args.keff_tol,
         loss_tol=args.loss_tol, device=args.device,
-        save_path=args.save_path, verbose=True,
+        save_path=args.save_path, ckpt_every=args.ckpt_every,
+        resume=args.resume, verbose=True,
     )
     print(f"\n最终 keff = {keff:.8f}")

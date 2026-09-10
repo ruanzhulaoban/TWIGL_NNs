@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --time=01:00:00
+#SBATCH --time=48:00:00
 
 # 1. 加载 miniforge 模块
 module load miniforge3/26.3.2-3
