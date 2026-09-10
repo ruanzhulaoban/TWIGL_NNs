@@ -368,20 +368,41 @@ def train(n_sub=50, n_poly=5, hidden_layers=8, neurons=400,
 
 if __name__ == "__main__":
    
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"设备: {device}, CUDA 可用: {torch.cuda.is_available()}")
-    n_sub = 8
-    x, y, w, region = make_training_points(n_sub=n_sub)
-    print(f"训练点总数: {x.numel()}（每子区域 {n_sub}×{n_sub}）")
-    print(f"区域索引取值: {torch.unique(region).tolist()}")
-    print(f"高斯权重总和 ≈ 面积 0.64: {w.sum().item():.6f}")
-    """
+    import argparse
+
+    p = argparse.ArgumentParser(description="TWIGL 源迭代训练")
+    p.add_argument("--device", default=None, help="cuda 或 cpu，默认自动检测")
+    p.add_argument("--save_path", default="twigl",
+                   help="保存前缀，模型为 <save_path>_g1.pt / <save_path>_g2.pt")
+    p.add_argument("--n_sub", type=int, default=50, help="每子区域每维高斯点数")
+    p.add_argument("--n_poly", type=int, default=5, help="B、s 多项式阶数")
+    p.add_argument("--hidden_layers", type=int, default=8, help="隐层层数")
+    p.add_argument("--neurons", type=int, default=400, help="每层神经元数")
+    p.add_argument("--adam_lr", type=float, default=1e-3, help="Adam 学习率")
+    p.add_argument("--adam_steps", type=int, default=50000,
+                   help="每个外层迭代内 Adam 步数")
+    p.add_argument("--lbfgs_lr", type=float, default=1.0, help="L-BFGS 学习率")
+    p.add_argument("--lbfgs_steps", type=int, default=500, help="L-BFGS 最大步数")
+    p.add_argument("--max_outer", type=int, default=30, help="外层最大迭代数")
+    p.add_argument("--keff_tol", type=float, default=1e-6, help="keff 收敛容差")
+    p.add_argument("--loss_tol", type=float, default=1e-4, help="损失收敛容差")
+    args = p.parse_args()
+
+    if args.device is None:
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("Warning: CUDA not available, fallback to cpu.")
+        args.device = "cpu"
+
+    print(f"设备: {args.device}, CUDA 可用: {torch.cuda.is_available()}")
+
     net1, net2, keff, history = train(
-        n_sub=8, n_poly=5, hidden_layers=2, neurons=64,
-        adam_lr=1e-3, adam_steps=20, lbfgs_lr=1.0, lbfgs_steps=3,
-        max_outer=2, keff_tol=1e-6, loss_tol=1e-4,
-        device=device, save_path="_test_twigl", verbose=True,
+        n_sub=args.n_sub, n_poly=args.n_poly,
+        hidden_layers=args.hidden_layers, neurons=args.neurons,
+        adam_lr=args.adam_lr, adam_steps=args.adam_steps,
+        lbfgs_lr=args.lbfgs_lr, lbfgs_steps=args.lbfgs_steps,
+        max_outer=args.max_outer, keff_tol=args.keff_tol,
+        loss_tol=args.loss_tol, device=args.device,
+        save_path=args.save_path, verbose=True,
     )
-    """
-    net1,net2,keff,history=train()
     print(f"\n最终 keff = {keff:.8f}")
