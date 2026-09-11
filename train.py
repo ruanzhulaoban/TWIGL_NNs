@@ -397,11 +397,14 @@ def train(n_sub=50, n_poly=5, hidden_layers=8, neurons=400,
         history = list(state["history"])
         total_loss_old = state["total_loss_old"]
         n_done = state["n_done"]
-        # 用最新权重重算上一轮通量与裂变源（与保存时刻的网络状态一致）
+        # 用最新权重重算上一轮通量，并按裂变源归一化（与保存时刻的归一化一致）
         with torch.no_grad():
             phi1_prev = net1(x, y)
             phi2_prev = net2(x, y)
-        F_old = fission_source_total(mat, phi1_prev, phi2_prev, w).item()
+            F_cur = fission_source_total(mat, phi1_prev, phi2_prev, w).item()
+            phi1_prev = phi1_prev / F_cur
+            phi2_prev = phi2_prev / F_cur
+        F_old = 1.0
         if state.get("n_sub", n_sub) != n_sub and verbose:
             print(f"Warning: 断点 n_sub={state.get('n_sub')} 与当前 {n_sub} 不一致，"
                   f"训练点按当前值重建，续训结果可能偏离。")
@@ -440,9 +443,14 @@ def train(n_sub=50, n_poly=5, hidden_layers=8, neurons=400,
         with torch.no_grad():
             phi2_new = net2(x, y)
 
-        # ---- keff 更新 ----
+        # ---- keff 更新（用未归一化的 φ1、φ2 计算裂变源）----
         F_new = fission_source_total(mat, phi1_new, phi2_new, w).item()
         keff_new = keff * (F_new / F_old)
+
+        # ---- 通量归一化：φ ← φ / F_new，使下一轮源项所用通量的裂变源归一为 1 ----
+        with torch.no_grad():
+            phi1_new = phi1_new / F_new
+            phi2_new = phi2_new / F_new
 
         total_loss = loss1 + loss2
         keff_change = abs(keff_new - keff)
@@ -485,7 +493,8 @@ def train(n_sub=50, n_poly=5, hidden_layers=8, neurons=400,
 
         phi1_prev = phi1_new.clone()
         phi2_prev = phi2_new.clone()
-        F_old = F_new
+        # 归一化后裂变源恒为 1，故下一轮 keff 更新的分母 F_old = 1
+        F_old = 1.0
         total_loss_old = total_loss
 
     # ---- 最终绘制（覆盖未整除 plot_every 的收尾迭代，含提前收敛） ----
