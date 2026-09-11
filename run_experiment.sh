@@ -9,6 +9,7 @@
 #   --device  cuda|cpu   训练/预测设备（默认自动检测，有 CUDA 用 cuda）
 #   --save_path NAME     模型保存前缀（默认 twigl，产物 twigl_g1.pt/g2.pt）
 #   --n_sub    N         每子区域每维高斯点数（默认 50，训练与预测需一致）
+#   --n_gpus   N         训练并行 GPU 数（默认 1；≥2 时两能群各占一张 GPU）
 #   --grid     N         预测细网格分辨率（默认 400）
 #   --outdir   DIR       预测图输出目录（默认 results）
 #
@@ -26,6 +27,7 @@ PYTHON="${PYTHON:-python}"
 DEVICE=""
 SAVE_PATH="twigl"
 N_SUB="50"
+N_GPUS="1"
 GRID="400"
 OUTDIR="results"
 
@@ -34,6 +36,7 @@ while [[ $# -gt 0 ]]; do
     --device)    DEVICE="$2";    shift 2 ;;
     --save_path) SAVE_PATH="$2"; shift 2 ;;
     --n_sub)     N_SUB="$2";     shift 2 ;;
+    --n_gpus)    N_GPUS="$2";    shift 2 ;;
     --grid)      GRID="$2";      shift 2 ;;
     --outdir)    OUTDIR="$2";    shift 2 ;;
     -h|--help)   head -n 24 "$0"; exit 0 ;;
@@ -56,7 +59,8 @@ echo "======================================================"
 
 echo ""
 echo "===== [1/2] 训练 train.py ====="
-"$PYTHON" train.py --device "$DEVICE" --save_path "$SAVE_PATH" --n_sub "$N_SUB"
+"$PYTHON" train.py --device "$DEVICE" --save_path "$SAVE_PATH" --n_sub "$N_SUB" \
+  --n_gpus "$N_GPUS"
 
 G1="${SAVE_PATH}_g1.pt"
 G2="${SAVE_PATH}_g2.pt"

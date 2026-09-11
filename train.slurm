@@ -3,7 +3,7 @@
 #SBATCH --output=job_%j.out
 #SBATCH --error=job_%j.err
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --time=48:00:00
@@ -17,6 +17,6 @@ source /data/apps/miniforge3/26.3.2-3/etc/profile.d/conda.sh
 # 3. 现在可以正常用 conda activate 了
 conda activate torch_env
 
-# 4. 进入代码目录并运行
+# 4. 进入代码目录并运行（两能群各占一张 GPU 并行训练）
 cd ~/run
-bash run_experiment.sh
+bash run_experiment.sh --n_gpus 2

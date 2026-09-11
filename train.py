@@ -1,6 +1,6 @@
 """源迭代训练模块（并行优化）。
 
-实现源迭代算法（功率迭代）求解 TWIGL 两群中子扩散基准：交替求解两个能群的
+实现源迭代算法（功率迭代）求解 TWIGL 两群中子扩散基准：并行求解两个能群的
 扩散方程（各自用一个 PSNNNet），并在外层更新有效增殖因子 keff 直至收敛。
 
 物理方程（能群 g，去掉 g 下标书写）：
@@ -13,20 +13,20 @@ TWIGL 裂变谱：χ = (1.0, 0.0)（裂变中子全部产生于快群）；散�
     Q_1 = (1/keff)(νΣf1 φ1 + νΣf2 φ2)
     Q_2 = Ss12 φ1
 
-并行策略：
-  - 多 GPU 可将每个能群网络用 nn.DataParallel 包装（批数据切分到多卡）；
-    或将两个能群的训练作为独立进程用 torch.multiprocessing 异步并行（Jacobi 式，
-    两群源项均取上一轮 φ）。
-  - 单卡则在同一个外层循环内依次训练两个网络（Gauss-Seidel 式）：
-    先训群 1（源项用上一轮 φ1、φ2），再用本轮更新后的 φ1 计算群 2 源项并训群 2，
-    保证散射源项使用最新 φ 值。
+并行策略（Jacobi 式）：
+  两个能群的源项均取上一轮 φ1、φ2，同一外层迭代内彼此独立，故用
+  multiprocessing（spawn）把两能群训练作为独立子进程并行执行；父进程每轮仅
+  负责源项/通量计算与 keff 更新。B、s 系数由父进程传入，子进程据此确定性
+  重建网络（reconstruct_net），训练完把更新后的权重与 Adam 状态送回父进程。
 
 注意：源项 Q 用 detach()/no_grad 计算，不参与梯度。
 
 仅依赖 PyTorch，使用 float32。
 """
 
+import concurrent.futures
 import json
+import multiprocessing
 import os
 
 import torch
@@ -204,6 +204,52 @@ def train_group(net, opt_adam, x, y, D, Sr, Q,
     return residual_loss(net, x, y, D, Sr, Q).detach().item()
 
 
+# ==================== 多进程并行训练 ====================
+def _state_to_cpu(state):
+    """把 state_dict / 优化器 state_dict 复制到 CPU，便于跨进程传输。
+
+    张量项 detach 并 .cpu()；非张量项（如 Adam 的 step 整数）原样保留。
+    """
+    return {k: (v.detach().cpu() if torch.is_tensor(v) else v)
+            for k, v in state.items()}
+
+
+def _train_group_worker(task):
+    """子进程 worker：确定性重建单群网络并训练，返回更新后的权重与优化器状态。
+
+    task 为可 pickle 的 dict（所有张量均在 CPU）。网络不直接跨进程传对象，
+    而是传 B/s 系数与 state_dict，由子进程用 reconstruct_net 确定性重建
+    （与父进程完全一致，不重做 SVD）。
+    """
+    activation = getattr(nn, task["activation"], nn.Tanh)
+    net = reconstruct_net(task["B_coeffs"], task["s_coeffs"], task["n"],
+                          hidden_layers=task["hidden_layers"],
+                          neurons=task["neurons"],
+                          activation=activation, dtype=torch.float32,
+                          device=task["device"])
+    net.load_state_dict(task["state_dict"])
+
+    opt = torch.optim.Adam(net.parameters(), lr=task["adam_lr"])
+    opt.load_state_dict(task["opt_state_dict"])
+
+    x = task["x"].to(task["device"]).requires_grad_(True)
+    y = task["y"].to(task["device"]).requires_grad_(True)
+    D = task["D"].to(task["device"])
+    Sr = task["Sr"].to(task["device"])
+    Q = task["Q"].to(task["device"])
+
+    loss = train_group(net, opt, x, y, D, Sr, Q,
+                       task["adam_steps"], task["lbfgs_steps"], task["lbfgs_lr"],
+                       label=task["label"], verbose=task["verbose"])
+
+    return {
+        "group": task["group"],
+        "loss": loss,
+        "state_dict": _state_to_cpu(net.state_dict()),
+        "opt_state_dict": _state_to_cpu(opt.state_dict()),
+    }
+
+
 # ==================== 训练历史可视化 ====================
 def plot_history(history, path, dpi=150):
     """将训练历史（损失与 keff）绘制为折线图并保存。
@@ -340,8 +386,8 @@ def load_checkpoint(path, device, adam_lr):
 def train(n_sub=50, n_poly=5, hidden_layers=8, neurons=400,
           adam_lr=1e-3, adam_steps=50000, lbfgs_lr=1.0, lbfgs_steps=500,
           max_outer=30, keff_tol=1e-6, loss_tol=1e-4,
-          device="cuda", save_path="twigl", plot_every=1, ckpt_every=1,
-          resume=True, verbose=True):
+          device="cuda", n_gpus=1, save_path="twigl", plot_every=1,
+          ckpt_every=1, resume=True, verbose=True):
     """源迭代求解 TWIGL，返回 (net1, net2, keff, history)。
 
     参数
@@ -362,6 +408,10 @@ def train(n_sub=50, n_poly=5, hidden_layers=8, neurons=400,
         keff 与损失的收敛容差。
     device : str
         "cuda" 或 "cpu"，默认 "cuda"。
+    n_gpus : int
+        并行使用的 GPU 数，默认 1。当 device 为 "cuda" 且 n_gpus ≥ 2 时，
+        两个能群的 worker 各占一张 GPU（群 1 → cuda:0，群 2 → cuda:1）；
+        否则两群共用 device（单卡 / CPU）。
     save_path : str
         保存前缀，实际保存为 <save_path>_g1.pt / <save_path>_g2.pt（实时覆盖，
         始终为最新权重）与 <save_path>_history.json（实时训练历史）。
@@ -375,12 +425,13 @@ def train(n_sub=50, n_poly=5, hidden_layers=8, neurons=400,
         若为 True 且存在 <save_path>_checkpoint.pt，则自动从断点续训；
         否则从头训练。
     """
-    # 1. 训练点
-    x, y, w, region = make_training_points(n_sub=n_sub)
-    x = x.to(device).requires_grad_(True)
-    y = y.to(device).requires_grad_(True)
-    w = w.to(device)
-    mat = material_tensors(region, device)
+    # 1. 训练点：CPU 副本供子进程传输；父进程用设备副本仅做前向/源项计算
+    x_cpu, y_cpu, w_cpu, region = make_training_points(n_sub=n_sub)
+    mat_cpu = material_tensors(region, "cpu")
+    x = x_cpu.to(device)
+    y = y_cpu.to(device)
+    w = w_cpu.to(device)
+    mat = {k: v.to(device) for k, v in mat_cpu.items()}
 
     # 实时保存路径：模型权重/断点每次覆盖为最新，历史 JSON 每轮追加写入
     p1 = f"{save_path}_g1.pt"
@@ -425,22 +476,65 @@ def train(n_sub=50, n_poly=5, hidden_layers=8, neurons=400,
         history = []
         total_loss_old = float("inf")
 
-    for n in range(n_done + 1, max_outer + 1):
-        # ---- 群 1：源项用上一轮 φ1、φ2 ----
-        Q1, _ = compute_sources(phi1_prev, phi2_prev, keff, mat)
-        loss1 = train_group(net1, opt1_adam, x, y, mat["D1"], mat["Sr1"], Q1,
-                            adam_steps, lbfgs_steps, lbfgs_lr,
-                            label="g1", verbose=verbose)
+    # 每个能群 worker 的训练设备：多卡时各占一张 GPU，否则共用 device
+    if device == "cuda" and n_gpus >= 2:
+        avail = torch.cuda.device_count()
+        if avail < n_gpus and verbose:
+            print(f"Warning: 请求 {n_gpus} 张 GPU，但仅检测到 {avail} 张，"
+                  f"两能群将尽可能各占一张（至多 cuda:1）。")
+        worker_device = {1: "cuda:0", 2: "cuda:1"}
+    else:
+        worker_device = {1: device, 2: device}
 
-        # ---- 群 2：散射源项用本轮最新 φ1（Gauss-Seidel） ----
+    # 并行子进程池：两能群各占一个 worker（spawn，规避 CUDA 的 fork 限制）
+    mp_ctx = multiprocessing.get_context("spawn")
+    executor = concurrent.futures.ProcessPoolExecutor(max_workers=2,
+                                                      mp_context=mp_ctx)
+
+    for n in range(n_done + 1, max_outer + 1):
+        # ---- Jacobi：两群源项均取上一轮 φ1、φ2，彼此独立可并行 ----
+        Q1, Q2 = compute_sources(phi1_prev, phi2_prev, keff, mat)
+
+        tasks = []
+        for group, net, opt, D, Sr, Q, s_coeffs, label in (
+            (1, net1, opt1_adam, mat_cpu["D1"], mat_cpu["Sr1"], Q1,
+             net1.s_coeffs, "g1"),
+            (2, net2, opt2_adam, mat_cpu["D2"], mat_cpu["Sr2"], Q2,
+             net2.s_coeffs, "g2"),
+        ):
+            tasks.append({
+                "group": group,
+                "device": worker_device[group],
+                "B_coeffs": net1.B_coeffs.cpu(),
+                "s_coeffs": s_coeffs.cpu(),
+                "n": net1.n,
+                "hidden_layers": net1.hidden_layers,
+                "neurons": net1.neurons,
+                "activation": net1.activation_name,
+                "state_dict": _state_to_cpu(net.state_dict()),
+                "opt_state_dict": _state_to_cpu(opt.state_dict()),
+                "x": x_cpu, "y": y_cpu,
+                "D": D, "Sr": Sr, "Q": Q.cpu(),
+                "adam_lr": adam_lr, "adam_steps": adam_steps,
+                "lbfgs_lr": lbfgs_lr, "lbfgs_steps": lbfgs_steps,
+                "label": label, "verbose": verbose,
+            })
+
+        # 两能群并行训练（各自独立子进程），完成后取回权重与 Adam 状态
+        fut1 = executor.submit(_train_group_worker, tasks[0])
+        fut2 = executor.submit(_train_group_worker, tasks[1])
+        r1 = fut1.result()
+        r2 = fut2.result()
+        results = {r["group"]: r for r in (r1, r2)}
+        net1.load_state_dict(results[1]["state_dict"])
+        net2.load_state_dict(results[2]["state_dict"])
+        opt1_adam.load_state_dict(results[1]["opt_state_dict"])
+        opt2_adam.load_state_dict(results[2]["opt_state_dict"])
+        loss1 = results[1]["loss"]
+        loss2 = results[2]["loss"]
+
         with torch.no_grad():
             phi1_new = net1(x, y)
-        _, Q2 = compute_sources(phi1_new, phi2_prev, keff, mat)
-        loss2 = train_group(net2, opt2_adam, x, y, mat["D2"], mat["Sr2"], Q2,
-                            adam_steps, lbfgs_steps, lbfgs_lr,
-                            label="g2", verbose=verbose)
-
-        with torch.no_grad():
             phi2_new = net2(x, y)
 
         # ---- keff 更新（用未归一化的 φ1、φ2 计算裂变源）----
@@ -497,6 +591,8 @@ def train(n_sub=50, n_poly=5, hidden_layers=8, neurons=400,
         F_old = 1.0
         total_loss_old = total_loss
 
+    executor.shutdown(wait=True)
+
     # ---- 最终绘制（覆盖未整除 plot_every 的收尾迭代，含提前收敛） ----
     if plot_every > 0:
         plot_history(history, f"{save_path}_history.png")
@@ -533,6 +629,8 @@ if __name__ == "__main__":
                    help="每个外层迭代内 Adam 步数")
     p.add_argument("--lbfgs_lr", type=float, default=1.0, help="L-BFGS 学习率")
     p.add_argument("--lbfgs_steps", type=int, default=500, help="L-BFGS 最大步数")
+    p.add_argument("--n_gpus", type=int, default=1,
+                   help="并行使用的 GPU 数：≥2 时两能群各占一张 GPU")
     p.add_argument("--max_outer", type=int, default=30, help="外层最大迭代数")
     p.add_argument("--ckpt_every", type=int, default=1,
                    help="每多少个外层迭代实时保存一次模型权重")
@@ -558,7 +656,7 @@ if __name__ == "__main__":
         adam_lr=args.adam_lr, adam_steps=args.adam_steps,
         lbfgs_lr=args.lbfgs_lr, lbfgs_steps=args.lbfgs_steps,
         max_outer=args.max_outer, keff_tol=args.keff_tol,
-        loss_tol=args.loss_tol, device=args.device,
+        loss_tol=args.loss_tol, device=args.device, n_gpus=args.n_gpus,
         save_path=args.save_path, ckpt_every=args.ckpt_every,
         resume=args.resume, verbose=True,
     )
