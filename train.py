@@ -36,9 +36,10 @@ import matplotlib
 matplotlib.use("Agg")  # 无显示环境直接保存
 import matplotlib.pyplot as plt
 
-from B_function import XS, YS, NX, NY, region_of, REGION_PARAMS, build_B
+from B_function import XS, YS, NX, NY, region_of, REGION_PARAMS
 from s_layer import build_s
 from network import PSNNNet, reconstruct_net
+from B_screen import get_B
 
 # TWIGL 裂变谱（χ1=1, χ2=0：裂变中子全部产生于快群）
 CHI = (1.0, 0.0)
@@ -123,7 +124,7 @@ def material_tensors(region, device):
 # ==================== 网络构造（共享 B） ====================
 def build_networks(n_poly=5, hidden_layers=8, neurons=400, device="cuda"):
     """构造两个能群网络，共享同一个 B_func（B 与能群无关，仅构造一次）。"""
-    B_func, B_coeffs = build_B(n=n_poly)
+    B_func, B_coeffs = get_B(n=n_poly)
     s1, sc1 = build_s(g=1, n=n_poly)
     s2, sc2 = build_s(g=2, n=n_poly)
     net1 = PSNNNet(B_func, s1, B_coeffs=B_coeffs, s_coeffs=sc1, n=n_poly,

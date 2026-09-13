@@ -23,8 +23,9 @@ B_function.build_B 与 s_layer.build_s 构造，均为无训练参数的固定�
 import torch
 import torch.nn as nn
 
-from B_function import _make_B_func, build_B
+from B_function import _make_B_func
 from s_layer import build_s
+from B_screen import get_B
 
 
 def _reconstruct_B(B_coeffs, n):
@@ -171,7 +172,7 @@ def make_psnn(g, n=5, Nd=None, hidden_layers=8, neurons=400,
     B、s 的系数与阶数会被一并保存进模型（供 save/load 确定性重建）。
     返回 model。
     """
-    B_func, B_coeffs = build_B(n=n, Nd=Nd, tol=tol)
+    B_func, B_coeffs = get_B(n=n, Nd=Nd, tol=tol)
     s_func, s_coeffs = build_s(g=g, n=n, Nd=Nd, tol=tol)
     return PSNNNet(B_func, s_func, B_coeffs=B_coeffs, s_coeffs=s_coeffs, n=n,
                    hidden_layers=hidden_layers, neurons=neurons,
